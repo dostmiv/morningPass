@@ -18,6 +18,7 @@ final class MorningAlarmManager: NSObject, ObservableObject, UNUserNotificationC
     #if canImport(AlarmKit)
     @available(iOS 26.0, *) private let alarmManager = AlarmManager.shared
     @available(iOS 26.0, *) private var updatesTask: Task<Void, Never>?
+    @available(iOS 26.0, *) private var alarmKitAuthorized = false
     #endif
 
     override init() {
@@ -27,6 +28,7 @@ final class MorningAlarmManager: NSObject, ObservableObject, UNUserNotificationC
 
         #if canImport(AlarmKit)
         if #available(iOS 26.0, *) {
+            alarmKitAuthorized = (alarmManager.authorizationState == .authorized)
             observeAlarmUpdates()
             requestAlarmAuthorization()
         }
@@ -55,30 +57,36 @@ final class MorningAlarmManager: NSObject, ObservableObject, UNUserNotificationC
             return false
         }
 
-        do {
-            try stopAlarm(session.alarmID)
-            ringingSession = nil
-            return true
-        } catch {
-            self.error = "Failed to stop alarm: \(error.localizedDescription)"
-            return false
-        }
+        stopAlarm(session.alarmID)
+        ringingSession = nil
+        return true
     }
 
-    private func stopAlarm(_ alarmID: UUID) throws {
+    private func stopAlarm(_ alarmID: UUID) {
+        stopAudibleRing()
+
         #if canImport(AlarmKit)
-        if #available(iOS 26.0, *) {
-            try alarmManager.stop(id: alarmID)
+        if #available(iOS 26.0, *), alarmKitAuthorized {
+            // AlarmKit may already purge one-shot alarms by the time user solves math.
+            // Ignore daemon errors and always allow local stop flow to complete.
+            do {
+                try alarmManager.stop(id: alarmID)
+            } catch {
+                do {
+                    try alarmManager.cancel(id: alarmID)
+                } catch {
+                    // best effort only
+                }
+            }
         }
         #endif
-        stopAudibleRing()
     }
 
     private func schedule(_ alarm: AlarmItem) async {
         scheduleLocalNotification(for: alarm)
 
         #if canImport(AlarmKit)
-        guard #available(iOS 26.0, *) else { return }
+        guard #available(iOS 26.0, *), alarmKitAuthorized else { return }
 
         do {
             let time = Alarm.Schedule.Relative.Time(hour: alarm.hour, minute: alarm.minute)
@@ -103,7 +111,7 @@ final class MorningAlarmManager: NSObject, ObservableObject, UNUserNotificationC
 
             _ = try await alarmManager.schedule(id: alarm.id, configuration: config)
         } catch {
-            self.error = "Failed to schedule AlarmKit alarm: \(error.localizedDescription)"
+            // Keep local notification scheduling as the primary reliable path.
         }
         #endif
     }
@@ -114,11 +122,11 @@ final class MorningAlarmManager: NSObject, ObservableObject, UNUserNotificationC
         notifications.removePendingNotificationRequests(withIdentifiers: suffixIDs)
 
         #if canImport(AlarmKit)
-        guard #available(iOS 26.0, *) else { return }
+        guard #available(iOS 26.0, *), alarmKitAuthorized else { return }
         do {
             try alarmManager.cancel(id: alarm.id)
         } catch {
-            self.error = "Failed to cancel alarm: \(error.localizedDescription)"
+            // best effort only
         }
         #endif
     }
@@ -188,9 +196,10 @@ final class MorningAlarmManager: NSObject, ObservableObject, UNUserNotificationC
     private func requestAlarmAuthorization() {
         Task {
             do {
-                _ = try await alarmManager.requestAuthorization()
+                let state = try await alarmManager.requestAuthorization()
+                alarmKitAuthorized = (state == .authorized)
             } catch {
-                self.error = "AlarmKit authorization failed: \(error.localizedDescription)"
+                alarmKitAuthorized = false
             }
         }
     }
